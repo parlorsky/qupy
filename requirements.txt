@@ -1,0 +1,11 @@
+# Core dependencies
+pandas>=1.5.0
+numpy>=1.20.0
+
+# Optional dependencies
+matplotlib>=3.5.0  # For plotting functionality
+polars>=0.18.0     # For faster CSV loading (optional)
+
+# Development dependencies (optional)
+pytest>=7.0.0      # For running tests
+jupyter>=1.0.0     # For notebook examples
