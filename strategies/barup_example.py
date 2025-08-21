@@ -1,16 +1,15 @@
 """
-BarUp strategy: Enter long when close > previous close, exit on opposite signal or time stop.
+BarUp strategy example using the new Strategy base class.
+
+This demonstrates the formal Strategy interface with proper lifecycle hooks,
+parameter validation, and deterministic behavior.
 """
 
-import sys
-import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from engine.strategy import Strategy, Context, FixedSizeStrategy
-import pandas as pd
+from engine.strategy_base import Strategy, Bar, register_strategy
 
 
-class BarUpStrategy(FixedSizeStrategy):
+@register_strategy("barup")
+class BarUpStrategy(Strategy):
     """
     Simple momentum strategy that enters long when current close > previous close.
     
@@ -22,264 +21,208 @@ class BarUpStrategy(FixedSizeStrategy):
     - OR after N bars (time stop)
     
     Parameters:
-    - size_mode: "notional" or "qty" 
-    - size_value: Trade size (dollar amount or quantity)
-    - max_bars: Maximum bars to hold position (0 = no limit)
-    - min_bars: Minimum bars to hold before considering exit
+    - lookback: Number of bars to look back for comparison (default: 1)
+    - notional: Notional value per trade in quote currency (default: 10000.0)
+    - time_stop: Maximum bars to hold position (default: 10)
     """
     
-    def _setup_params(self):
-        super()._setup_params()
-        
-        self.max_bars = self.params.get('max_bars', 0)  # 0 = no time stop
-        self.min_bars = self.params.get('min_bars', 1)  # Minimum holding period
-        
-        # Internal state
-        self.prev_close = None
-        self.entry_bar = None
-        self.bars_in_position = 0
-        
-        if self.max_bars < 0:
-            raise ValueError("max_bars must be >= 0")
-        if self.min_bars < 0:
-            raise ValueError("min_bars must be >= 0")
+    name = "barup"
     
-    def on_start(self, context: Context) -> None:
-        """Initialize strategy state."""
-        pass
+    @classmethod
+    def param_schema(cls):
+        return {
+            "lookback": {"type": "int", "min": 1, "default": 1},
+            "notional": {"type": "float", "min": 0, "default": 10_000.0},
+            "time_stop": {"type": "int", "min": 1, "default": 10}
+        }
     
-    def on_bar(self, context: Context, bar: pd.Series) -> None:
-        """Process each bar for entry/exit signals."""
-        current_close = bar['close']
-        current_position = context.position
+    def on_init(self, context):
+        """Initialize strategy parameters and state."""
+        self.lookback = int(self.params.get("lookback", 1))
+        self.notional = float(self.params.get("notional", 10_000.0))
+        self.time_stop = int(self.params.get("time_stop", 10))
         
-        # Update bars in position counter
-        if not current_position.is_flat:
-            self.bars_in_position += 1
+        # Strategy state
+        self.bars_held = 0
+        
+        context.log("info", f"BarUp strategy initialized with lookback={self.lookback}, "
+                           f"notional={self.notional}, time_stop={self.time_stop}")
+    
+    def on_start(self, context):
+        """Called at start of backtest run."""
+        context.log("info", "BarUp strategy starting")
+        context.record("lookback", self.lookback)
+        context.record("notional", self.notional)
+    
+    def on_bar(self, context, symbol: str, bar: Bar):
+        """Main trading logic called for each bar."""
+        
+        # Close logic first - check if we should exit existing position
+        if context.position.qty != 0:
+            self.bars_held += 1
+            
+            # Get previous close for exit signal
+            if self.lookback + 1 <= context.bar_index:
+                prev_closes = context.data.history(symbol, "close", 2)
+                if len(prev_closes) >= 2:
+                    prev_close = prev_closes[0]  # Previous bar's close
+                    
+                    # Exit conditions
+                    exit_reason = None
+                    if bar.close < prev_close:
+                        exit_reason = "Exit:BarDown"
+                    elif self.bars_held >= self.time_stop:
+                        exit_reason = "Exit:TimeStop"
+                    
+                    if exit_reason:
+                        context.close(reason=exit_reason)
+                        context.log("info", f"Position closed: {exit_reason}, "
+                                          f"price={bar.close:.6f}, bars_held={self.bars_held}")
+                        self.bars_held = 0
+                        return
+        
+        # Entry logic - only enter if flat
+        if context.position.qty == 0:
+            # Need enough history for comparison
+            if context.bar_index >= self.lookback:
+                closes = context.data.history(symbol, "close", self.lookback + 1)
+                
+                if len(closes) >= self.lookback + 1:
+                    current_close = closes[-1]  # Current bar close
+                    prev_close = closes[-2]     # Previous bar close
+                    
+                    # Enter long if current close > previous close
+                    if current_close > prev_close:
+                        qty = context.size.from_notional(self.notional, price=bar.close)
+                        context.buy(qty, reason="Entry:BarUp")
+                        context.tag_trade("BarUp")
+                        
+                        context.log("info", f"Long entry: price={bar.close:.6f}, "
+                                          f"qty={qty:.4f}, signal={current_close:.6f}>{prev_close:.6f}")
+                        
+                        # Record entry metrics
+                        context.record("entry_price", bar.close)
+                        context.record("signal_strength", (current_close - prev_close) / prev_close)
+    
+    def on_trade_open(self, context, trade):
+        """Called when a new position is established."""
+        self.bars_held = 0
+        context.log("info", f"Trade opened: {trade.side} {trade.qty} @ {trade.entry_price}")
+        context.record("trade_entry", trade.entry_price)
+    
+    def on_trade_close(self, context, trade):
+        """Called when a position is fully closed."""
+        if trade.pnl is not None:
+            context.log("info", f"Trade closed: PnL={trade.pnl:.2f}, "
+                              f"entry={trade.entry_price:.6f}, exit={trade.exit_price:.6f}")
+            context.record("trade_pnl", trade.pnl)
+            context.record("trade_exit", trade.exit_price or 0)
+    
+    def on_stop(self, context):
+        """Called at end of backtest."""
+        # Close any remaining position
+        if context.position.qty != 0:
+            context.close(reason="EndOfBacktest")
+        
+        context.log("info", "BarUp strategy completed")
+
+
+@register_strategy("barup_multi")
+class BarUpMultiAsset(Strategy):
+    """
+    Multi-asset version of BarUp that can trade multiple symbols.
+    
+    Demonstrates cross-asset signal generation and portfolio-level logic.
+    """
+    
+    name = "barup_multi"
+    
+    @classmethod
+    def param_schema(cls):
+        return {
+            "lookback": {"type": "int", "min": 1, "default": 1},
+            "notional_per_symbol": {"type": "float", "min": 0, "default": 5_000.0},
+            "max_positions": {"type": "int", "min": 1, "default": 3},
+            "time_stop": {"type": "int", "min": 1, "default": 10}
+        }
+    
+    def on_init(self, context):
+        """Initialize multi-asset strategy."""
+        self.lookback = int(self.params.get("lookback", 1))
+        self.notional_per_symbol = float(self.params.get("notional_per_symbol", 5_000.0))
+        self.max_positions = int(self.params.get("max_positions", 3))
+        self.time_stop = int(self.params.get("time_stop", 10))
+        
+        # Track bars held per symbol
+        self.bars_held = {}
+    
+    def universe(self) -> list:
+        """Return symbols to trade - empty means use whatever is provided."""
+        return []
+    
+    def on_bar(self, context, symbol: str, bar: Bar):
+        """Per-symbol trading logic."""
+        
+        # Initialize symbol tracking
+        if symbol not in self.bars_held:
+            self.bars_held[symbol] = 0
+        
+        # Get current position for this symbol
+        position = context.position
+        
+        # Close logic
+        if position.qty != 0:
+            self.bars_held[symbol] += 1
+            
+            if context.bar_index >= 1:
+                prev_closes = context.data.history(symbol, "close", 2)
+                if len(prev_closes) >= 2 and bar.close < prev_closes[0]:
+                    context.close(reason="Exit:BarDown")
+                    self.bars_held[symbol] = 0
+                    return
+                elif self.bars_held[symbol] >= self.time_stop:
+                    context.close(reason="Exit:TimeStop")
+                    self.bars_held[symbol] = 0
+                    return
+        
+        # Entry logic - check portfolio constraints
         else:
-            self.bars_in_position = 0
-        
-        # Entry logic
-        if current_position.is_flat and self.prev_close is not None:
-            if current_close > self.prev_close:
-                # Enter long position
-                context.buy(
-                    size=self.size_value,
-                    reason=f"BarUp entry: {current_close:.6f} > {self.prev_close:.6f}",
-                    size_mode=self.size_mode
-                )
-                self.entry_bar = context.bar_index
-                self.bars_in_position = 1
-        
-        # Exit logic
-        elif not current_position.is_flat:
-            should_exit = False
-            exit_reason = ""
+            # Count current positions across portfolio
+            current_positions = len([exp for exp in context.portfolio.exposures.values() if abs(exp) > 0])
             
-            # Check time stop
-            if self.max_bars > 0 and self.bars_in_position >= self.max_bars:
-                should_exit = True
-                exit_reason = f"Time stop: {self.bars_in_position} bars"
-            
-            # Check opposite signal (but only after minimum holding period)
-            elif (self.bars_in_position >= self.min_bars and 
-                  self.prev_close is not None and 
-                  current_close < self.prev_close):
-                should_exit = True
-                exit_reason = f"BarDown exit: {current_close:.6f} < {self.prev_close:.6f}"
-            
-            if should_exit:
-                context.close(reason=exit_reason)
-                self.entry_bar = None
-                self.bars_in_position = 0
-        
-        # Update state for next bar
-        self.prev_close = current_close
+            if current_positions < self.max_positions and context.bar_index >= self.lookback:
+                closes = context.data.history(symbol, "close", self.lookback + 1)
+                
+                if len(closes) >= 2 and closes[-1] > closes[-2]:
+                    qty = context.size.from_notional(self.notional_per_symbol, price=bar.close)
+                    context.buy(qty, reason="Entry:BarUp")
+                    context.tag_trade(f"BarUp-{symbol}")
+                    
+                    context.log("info", f"Multi-asset entry: {symbol} @ {bar.close:.6f}")
     
-    def on_stop(self, context: Context) -> None:
-        """Clean up at end of backtest."""
-        if not context.position.is_flat:
-            context.close("End of backtest")
-
-
-class BarUpWithStopLoss(BarUpStrategy):
-    """
-    Enhanced BarUp strategy with stop-loss functionality.
-    
-    Additional Parameters:
-    - stop_loss_pct: Stop loss percentage (e.g., 0.05 for 5%)
-    - take_profit_pct: Take profit percentage (optional)
-    """
-    
-    def _setup_params(self):
-        super()._setup_params()
-        
-        self.stop_loss_pct = self.params.get('stop_loss_pct', 0.0)
-        self.take_profit_pct = self.params.get('take_profit_pct', 0.0)
-        
-        if self.stop_loss_pct < 0:
-            raise ValueError("stop_loss_pct must be >= 0")
-        if self.take_profit_pct < 0:
-            raise ValueError("take_profit_pct must be >= 0")
-    
-    def on_bar(self, context: Context, bar: pd.Series) -> None:
-        """Enhanced bar processing with stop-loss logic."""
-        current_close = bar['close']
-        current_low = bar['low']
-        current_high = bar['high']
-        current_position = context.position
-        
-        # Update bars in position counter
-        if not current_position.is_flat:
-            self.bars_in_position += 1
-        else:
-            self.bars_in_position = 0
-        
-        # Entry logic (same as parent)
-        if current_position.is_flat and self.prev_close is not None:
-            if current_close > self.prev_close:
-                context.buy(
-                    size=self.size_value,
-                    reason=f"BarUp entry: {current_close:.6f} > {self.prev_close:.6f}",
-                    size_mode=self.size_mode
-                )
-                self.entry_bar = context.bar_index
-                self.bars_in_position = 1
-        
-        # Exit logic with stop-loss
-        elif not current_position.is_flat:
-            should_exit = False
-            exit_reason = ""
-            
-            # Check stop-loss (using intrabar low for long positions)
-            if (self.stop_loss_pct > 0 and current_position.is_long):
-                stop_price = current_position.avg_price * (1 - self.stop_loss_pct)
-                if current_low <= stop_price:
-                    should_exit = True
-                    exit_reason = f"Stop loss: {current_low:.6f} <= {stop_price:.6f}"
-            
-            # Check take profit (using intrabar high for long positions)
-            elif (self.take_profit_pct > 0 and current_position.is_long):
-                take_profit_price = current_position.avg_price * (1 + self.take_profit_pct)
-                if current_high >= take_profit_price:
-                    should_exit = True
-                    exit_reason = f"Take profit: {current_high:.6f} >= {take_profit_price:.6f}"
-            
-            # Check time stop
-            elif self.max_bars > 0 and self.bars_in_position >= self.max_bars:
-                should_exit = True
-                exit_reason = f"Time stop: {self.bars_in_position} bars"
-            
-            # Check opposite signal
-            elif (self.bars_in_position >= self.min_bars and 
-                  self.prev_close is not None and 
-                  current_close < self.prev_close):
-                should_exit = True
-                exit_reason = f"BarDown exit: {current_close:.6f} < {self.prev_close:.6f}"
-            
-            if should_exit:
-                context.close(reason=exit_reason)
-                self.entry_bar = None
-                self.bars_in_position = 0
-        
-        # Update state for next bar
-        self.prev_close = current_close
-
-
-class BarUpMeanReversion(Strategy):
-    """
-    Mean reversion version: Enter long when price drops below moving average,
-    exit when it rises above.
-    
-    Parameters:
-    - lookback: Moving average lookback period
-    - size_mode: "notional" or "qty"
-    - size_value: Trade size
-    - threshold_pct: Percentage below MA to trigger entry (e.g., 0.02 for 2%)
-    """
-    
-    def _setup_params(self):
-        self.lookback = self.params.get('lookback', 20)
-        self.size_mode = self.params.get('size_mode', 'notional')
-        self.size_value = self.params.get('size_value', 1000.0)
-        self.threshold_pct = self.params.get('threshold_pct', 0.01)
-        
-        # State
-        self.price_history = []
-        
-        if self.lookback <= 0:
-            raise ValueError("lookback must be > 0")
-        if self.threshold_pct < 0:
-            raise ValueError("threshold_pct must be >= 0")
-    
-    def on_start(self, context: Context) -> None:
-        pass
-    
-    def on_bar(self, context: Context, bar: pd.Series) -> None:
-        current_close = bar['close']
-        current_position = context.position
-        
-        # Update price history
-        self.price_history.append(current_close)
-        if len(self.price_history) > self.lookback:
-            self.price_history.pop(0)
-        
-        # Need enough history for moving average
-        if len(self.price_history) < self.lookback:
-            return
-        
-        # Calculate moving average
-        ma = sum(self.price_history) / len(self.price_history)
-        
-        # Entry logic: price significantly below MA
-        if current_position.is_flat:
-            threshold_price = ma * (1 - self.threshold_pct)
-            if current_close < threshold_price:
-                context.buy(
-                    size=self.size_value,
-                    reason=f"Mean reversion entry: {current_close:.6f} < {threshold_price:.6f} (MA: {ma:.6f})",
-                    size_mode=self.size_mode
-                )
-        
-        # Exit logic: price back above MA
-        elif current_position.is_long and current_close > ma:
-            context.close(f"Mean reversion exit: {current_close:.6f} > MA {ma:.6f}")
-    
-    def on_stop(self, context: Context) -> None:
-        if not context.position.is_flat:
-            context.close("End of backtest")
+    def on_trade_open(self, context, trade):
+        """Reset bars held counter when trade opens."""
+        symbol = trade.symbol
+        self.bars_held[symbol] = 0
 
 
 # Factory functions for easy strategy creation
-def create_basic_barup(size_value: float = 1000, size_mode: str = "notional", 
-                       max_bars: int = 0, min_bars: int = 1) -> BarUpStrategy:
-    """Create a basic BarUp strategy with common parameters."""
-    return BarUpStrategy(
-        size_value=size_value,
-        size_mode=size_mode,
-        max_bars=max_bars,
-        min_bars=min_bars
-    )
+def create_basic_barup(lookback: int = 1, notional: float = 10_000.0, 
+                       time_stop: int = 10) -> BarUpStrategy:
+    """Create a basic BarUp strategy with specified parameters."""
+    return BarUpStrategy(params={
+        "lookback": lookback,
+        "notional": notional,
+        "time_stop": time_stop
+    })
 
 
-def create_barup_with_stops(size_value: float = 1000, size_mode: str = "notional",
-                           max_bars: int = 0, stop_loss_pct: float = 0.05,
-                           take_profit_pct: float = 0.0) -> BarUpWithStopLoss:
-    """Create a BarUp strategy with stop-loss and take-profit."""
-    return BarUpWithStopLoss(
-        size_value=size_value,
-        size_mode=size_mode,
-        max_bars=max_bars,
-        stop_loss_pct=stop_loss_pct,
-        take_profit_pct=take_profit_pct
-    )
-
-
-def create_mean_reversion(size_value: float = 1000, lookback: int = 20,
-                         threshold_pct: float = 0.02) -> BarUpMeanReversion:
-    """Create a mean reversion strategy."""
-    return BarUpMeanReversion(
-        size_value=size_value,
-        lookback=lookback,
-        threshold_pct=threshold_pct
-    )
+def create_barup_multi(lookback: int = 1, notional_per_symbol: float = 5_000.0,
+                       max_positions: int = 3, time_stop: int = 10) -> BarUpMultiAsset:
+    """Create a multi-asset BarUp strategy."""
+    return BarUpMultiAsset(params={
+        "lookback": lookback,
+        "notional_per_symbol": notional_per_symbol,
+        "max_positions": max_positions,
+        "time_stop": time_stop
+    })
