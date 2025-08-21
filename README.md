@@ -1,4 +1,8 @@
-# Backtesting Engine
+# qupy
+
+## like numpy but quantitative
+
+## Backtesting Engine
 
 A backtesting framework for trading strategies.
 
