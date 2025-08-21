@@ -7,8 +7,8 @@ A backtesting framework for trading strategies.
 ### From Source
 
 ```bash
-git clone https://github.com/your-username/backtesting-engine.git
-cd backtesting-engine
+git clone https://github.com/parlorsky/qupy.git
+cd qupy
 pip install -e .
 ```
 
@@ -18,8 +18,8 @@ pip install -e .
 
 ```bash
 # Clone the repository to get sample data
-git clone https://github.com/your-username/backtesting-engine.git
-cd backtesting-engine
+git clone https://github.com/parlorsky/qupy.git
+cd qupy
 python examples/run_barup.py
 ```
 
