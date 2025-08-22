@@ -203,21 +203,23 @@ class TradingPlots:
         for result in results:
             strategies.append(result.get('strategy_name', 'Unknown'))
             
+            value = None
             if metric in result:
-                values.append(result[metric])
+                value = result[metric]
             elif 'risk_metrics' in result and metric in result['risk_metrics']:
-                values.append(result['risk_metrics'][metric])
+                value = result['risk_metrics'][metric]
             elif 'performance_metrics' in result and metric in result['performance_metrics']:
-                values.append(result['performance_metrics'][metric])
-            else:
-                values.append(0)
+                value = result['performance_metrics'][metric]
+            
+            # Handle None values
+            values.append(value if value is not None else 0)
         
         if chart_type == "bar":
             fig = go.Figure(data=[
                 go.Bar(
                     x=strategies,
                     y=values,
-                    text=[f'{v:.3f}' for v in values],
+                    text=[f'{v:.3f}' if v is not None else 'N/A' for v in values],
                     textposition='auto',
                     marker_color=self.colors['primary']
                 )
@@ -234,9 +236,12 @@ class TradingPlots:
             sharpes = []
             
             for result in results:
-                returns.append(result.get('total_return', 0))
+                total_return = result.get('total_return', 0)
+                returns.append(total_return if total_return is not None else 0)
+                
                 if 'risk_metrics' in result:
-                    sharpes.append(result['risk_metrics'].get('sharpe_ratio', 0))
+                    sharpe = result['risk_metrics'].get('sharpe_ratio', 0)
+                    sharpes.append(sharpe if sharpe is not None else 0)
                 else:
                     sharpes.append(0)
             
@@ -274,6 +279,10 @@ class TradingPlots:
                     elif 'risk_metrics' in result and m in result['risk_metrics']:
                         val = result['risk_metrics'][m]
                     else:
+                        val = 0
+                    
+                    # Handle None values
+                    if val is None:
                         val = 0
                     
                     # Normalize metrics (invert drawdown)
