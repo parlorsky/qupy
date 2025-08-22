@@ -87,8 +87,8 @@ class Trade:
 class DataAccessor:
     """Safe data accessor with lookahead protection."""
     
-    def __init__(self, data_engine, current_index: int):
-        self._data_engine = data_engine
+    def __init__(self, backtest_engine, current_index: int):
+        self._backtest_engine = backtest_engine
         self._current_index = current_index
     
     def history(self, symbol: str, field: str, n: int) -> List[float]:
@@ -109,8 +109,22 @@ class DataAccessor:
         if n <= 0:
             raise ValueError("n must be positive")
             
-        # Implementation would check bounds and prevent lookahead
-        return self._data_engine.get_history(symbol, field, self._current_index, n)
+        # Get data from BacktestEngine
+        data = self._backtest_engine.data
+        
+        # Calculate start and end indices
+        end_idx = self._current_index + 1  # Include current bar
+        start_idx = max(0, end_idx - n)
+        
+        if start_idx >= len(data):
+            return []
+        
+        # Extract the field
+        if field not in data.columns:
+            raise ValueError(f"Field '{field}' not found in data")
+        
+        values = data[field].iloc[start_idx:end_idx].tolist()
+        return values
     
     def window(self, symbol: str, n: int) -> List[Bar]:
         """
@@ -126,7 +140,31 @@ class DataAccessor:
         if n <= 0:
             raise ValueError("n must be positive")
             
-        return self._data_engine.get_window(symbol, self._current_index, n)
+        # Get data from BacktestEngine
+        data = self._backtest_engine.data
+        
+        # Calculate start and end indices
+        end_idx = self._current_index + 1  # Include current bar
+        start_idx = max(0, end_idx - n)
+        
+        if start_idx >= len(data):
+            return []
+        
+        # Convert to Bar objects
+        bars = []
+        for idx in range(start_idx, end_idx):
+            row = data.iloc[idx]
+            bar = Bar(
+                dt_open=row['dt_open'],
+                dt_close=row['dt_close'],
+                open=row['open'],
+                high=row['high'],
+                low=row['low'],
+                close=row['close'],
+                volume=row['volume']
+            )
+            bars.append(bar)
+        return bars
     
     def panel_history(self, symbols: List[str], field: str, n: int) -> Dict[str, List[float]]:
         """
@@ -209,12 +247,13 @@ class Context:
         self._logger = logging.getLogger(f"strategy.{symbol}")
         self._records = {}
         self._trade_tags = []
+        self._orders = []  # Orders placed this bar
         
         # Set up deterministic RNG
         self._rng = random.Random(seed)
         
         # Initialize data accessor and size calculator
-        self.data = DataAccessor(engine.data_engine, self._current_index)
+        self.data = DataAccessor(engine, self._current_index)
         self.size = SizeCalculator(self)
     
     # Current state properties
@@ -239,12 +278,36 @@ class Context:
     @property
     def position(self) -> Position:
         """Current position for the symbol."""
-        return self._engine.get_position(self._current_symbol)
+        # Get position from BacktestEngine's position_manager
+        pm = self._engine.position_manager
+        
+        # Create position object compatible with strategy expectations
+        class SimplePosition:
+            def __init__(self, qty, avg_price):
+                self.qty = qty
+                self.avg_price = avg_price
+                
+            @property
+            def direction(self):
+                if self.qty > 0:
+                    return "long"
+                elif self.qty < 0:
+                    return "short"
+                else:
+                    return "flat"
+        
+        return SimplePosition(pm.position_qty, pm.position_avg_price)
     
     @property
     def portfolio(self) -> Portfolio:
         """Portfolio-level information."""
-        return self._engine.get_portfolio()
+        # Create simplified portfolio object
+        class SimplePortfolio:
+            def __init__(self, engine):
+                self.cash = engine.cash
+                self.equity = engine.equity
+        
+        return SimplePortfolio(self._engine)
     
     @property
     def pending_orders(self) -> List[Order]:
@@ -263,69 +326,72 @@ class Context:
     
     # Order placement methods
     
-    def buy(self, size: float, reason: str = "") -> str:
+    def buy(self, size: float, reason: str = "", size_mode: str = "notional") -> None:
         """
         Place market buy order.
         
         Args:
-            size: Quantity to buy (positive)
+            size: Quantity or notional to buy (positive)
             reason: Optional reason for the trade
-            
-        Returns:
-            Order ID
+            size_mode: "qty" for base quantity or "notional" for quote currency amount
         """
-        return self._engine.place_order(
-            symbol=self._current_symbol,
+        from .strategy import Order  # Import simple Order class
+        
+        if size <= 0:
+            raise ValueError("Order size must be positive")
+            
+        order = Order(
             side="buy",
-            order_type="market",
-            size=abs(size),
-            reason=reason,
-            tags=self._trade_tags.copy()
+            size=size,
+            size_mode=size_mode,
+            reason=reason
         )
+        self._orders.append(order)
     
-    def sell(self, size: float, reason: str = "") -> str:
+    def sell(self, size: float, reason: str = "", size_mode: str = "notional") -> None:
         """
         Place market sell order.
         
         Args:
-            size: Quantity to sell (positive)
+            size: Quantity or notional to sell (positive)
             reason: Optional reason for the trade
-            
-        Returns:
-            Order ID
+            size_mode: "qty" for base quantity or "notional" for quote currency amount
         """
-        return self._engine.place_order(
-            symbol=self._current_symbol,
+        from .strategy import Order  # Import simple Order class
+        
+        if size <= 0:
+            raise ValueError("Order size must be positive")
+            
+        order = Order(
             side="sell",
-            order_type="market",
-            size=abs(size),
-            reason=reason,
-            tags=self._trade_tags.copy()
+            size=size,
+            size_mode=size_mode,
+            reason=reason
         )
+        self._orders.append(order)
     
-    def close(self, reason: str = "") -> Optional[str]:
+    def close(self, reason: str = "") -> None:
         """
         Close current position with market order.
         
         Args:
             reason: Optional reason for closing
-            
-        Returns:
-            Order ID if position exists, None otherwise
         """
+        from .strategy import Order  # Import simple Order class
+        
         pos = self.position
         if pos.qty == 0:
-            return None
+            return
             
         side = "sell" if pos.qty > 0 else "buy"
-        return self._engine.place_order(
-            symbol=self._current_symbol,
+        
+        order = Order(
             side=side,
-            order_type="market",
             size=abs(pos.qty),
-            reason=reason,
-            tags=self._trade_tags.copy()
+            size_mode="qty",
+            reason=reason
         )
+        self._orders.append(order)
     
     def limit_buy(self, price: float, size: float, tif: str = "GTC", reason: str = "") -> str:
         """Place limit buy order."""
@@ -455,6 +521,12 @@ class Context:
     def get_records(self) -> Dict[str, List[tuple]]:
         """Get all recorded time-series data."""
         return self._records.copy()
+    
+    def get_orders(self):
+        """Get orders placed this bar and clear the list."""
+        orders = self._orders.copy()
+        self._orders.clear()
+        return orders
     
     # Internal methods for engine use
     
